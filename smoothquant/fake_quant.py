@@ -35,6 +35,45 @@ def quantize_activation_per_token_absmax(t, n_bits=8):
 
 
 @torch.no_grad()
+def quantize_activation_per_token_affine(t, n_bits=8):
+    t_shape = t.shape
+    t.view(-1, t_shape[-1])
+
+    xmax = t.max(dim=-1, keepdim=True)[0]
+    xmin = t.min(dim=-1, keepdim=True)[0]
+    q_max = 2**n_bits - 1
+
+    scales = xmax - xmin
+    scales.clamp_(min=1e-5).div_(q_max)
+    zeroes = torch.round(-xmin / scales)
+
+    q = torch.clamp(torch.round(t / scales) + zeroes, 0, q_max)
+    return scales * (q - zeroes)
+
+
+@torch.no_grad()
+def quantize_activation_per_token_groupwise_affine(t, n_bits, groupsize):
+    init_shape = t.shape
+    reshaped_t = t.reshape(-1, t.shape[-2], t.shape[-1] // groupsize, groupsize)
+
+    xmax = torch.amax(reshaped_t, dim=3, keepdim=True)
+    xmin = torch.amin(reshaped_t, dim=3, keepdim=True)
+
+    q_max = 2**n_bits - 1
+    tmp = (xmin == 0) & (xmax == 0)
+    xmin[tmp] = -1
+    xmax[tmp] = +1
+    scales = (xmax - xmin) / q_max
+    zeroes = torch.round(-xmin / scales)
+
+    scales = scales.repeat(1, 1, 1, groupsize).reshape(init_shape)
+    zeroes = zeroes.repeat(1, 1, 1, groupsize).reshape(init_shape)
+
+    q = torch.clamp(torch.round(t / scales) + zeroes, 0, q_max)
+    return scales * (q - zeroes)
+
+
+@torch.no_grad()
 def quantize_activation_per_tensor_absmax(t, n_bits=8):
     t_shape = t.shape
     t.view(-1, t_shape[-1])
@@ -45,7 +84,7 @@ def quantize_activation_per_tensor_absmax(t, n_bits=8):
     return t
 
 
-class W8A8Linear(nn.Module):
+class WQAQLinear(nn.Module):
     def __init__(
         self,
         in_features,
@@ -53,10 +92,16 @@ class W8A8Linear(nn.Module):
         bias=True,
         act_quant="per_token",
         quantize_output=False,
+        a_prec=8,
+        w_prec=8,
+        o_prec=8,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.a_prec = a_prec
+        self.w_prec = w_prec
+        self.o_prec = o_prec
 
         self.register_buffer(
             "weight",
@@ -79,22 +124,35 @@ class W8A8Linear(nn.Module):
 
         if act_quant == "per_token":
             self.act_quant_name = "per_token"
-            self.act_quant = partial(quantize_activation_per_token_absmax, n_bits=8)
+            self.act_quant = partial(
+                quantize_activation_per_token_absmax, n_bits=self.a_prec
+            )
+        elif act_quant == "per_token_affine":
+            self.act_quant_name = "per_token_affine"
+            self.act_quant = partial(
+                quantize_activation_per_token_affine, n_bits=self.a_prec
+            )
         elif act_quant == "per_tensor":
             self.act_quant_name = "per_tensor"
-            self.act_quant = partial(quantize_activation_per_tensor_absmax, n_bits=8)
+            self.act_quant = partial(
+                quantize_activation_per_tensor_absmax, n_bits=self.a_prec
+            )
         else:
             raise ValueError(f"Invalid act_quant: {act_quant}")
 
-        if quantize_output:
-            self.output_quant_name = self.act_quant_name
-            self.output_quant = self.act_quant
+        if quantize_output:  # This is only for K and V, Q is excluded
+            self.output_quant_name = "per_token_groupwise_affine"
+            self.output_quant = partial(
+                quantize_activation_per_token_groupwise_affine,
+                n_bits=self.o_prec,
+                groupsize=128,
+            )
         else:
             self.output_quant_name = "None"
             self.output_quant = lambda x: x
 
     def to(self, *args, **kwargs):
-        super(W8A8Linear, self).to(*args, **kwargs)
+        super(WQAQLinear, self).to(*args, **kwargs)
         self.weight = self.weight.to(*args, **kwargs)
         if self.bias is not None:
             self.bias = self.bias.to(*args, **kwargs)
@@ -109,24 +167,32 @@ class W8A8Linear(nn.Module):
 
     @staticmethod
     def from_float(
-        module, weight_quant="per_channel", act_quant="per_token", quantize_output=False
+        module,
+        weight_quant="per_channel",
+        act_quant="per_token",
+        quantize_output=False,
+        a_prec=8,
+        w_prec=8,
+        o_prec=8,  # this is only important when quantize_output is True, like in KV quantization
     ):
-        assert isinstance(module, torch.nn.Linear)
-        new_module = W8A8Linear(
+        assert isinstance(module, (torch.nn.Linear, WQAQLinear))
+        new_module = WQAQLinear(
             module.in_features,
             module.out_features,
             module.bias is not None,
             act_quant=act_quant,
             quantize_output=quantize_output,
+            a_prec=a_prec,
+            w_prec=w_prec,
+            o_prec=o_prec,
         )
         if weight_quant == "per_channel":
-            new_module.weight = quantize_weight_per_channel_absmax(
-                module.weight, n_bits=8
-            )  # use 8-bit integer for weight
+            new_module.weight = module.weight
+            # new_module.weight = quantize_weight_per_channel_absmax(
+            #     module.weight, n_bits=w_prec
+            # )
         elif weight_quant == "per_tensor":
-            new_module.weight = quantize_weight_per_tensor_absmax(
-                module.weight, n_bits=8
-            )
+            new_module.weight = module.weight
         else:
             raise ValueError(f"Invalid weight_quant: {weight_quant}")
         new_module.weight_quant_name = weight_quant
@@ -135,53 +201,82 @@ class W8A8Linear(nn.Module):
         return new_module
 
     def __repr__(self):
-        return f"W8A8Linear({self.in_features}, {self.out_features}, bias={self.bias is not None}, weight_quant={self.weight_quant_name}, act_quant={self.act_quant_name}, output_quant={self.output_quant_name})"
+        return f"WQAQLinear(a_prec={self.a_prec}, w_prec={self.w_prec}, {self.in_features}, {self.out_features}, bias={self.bias is not None}, weight_quant={self.weight_quant_name}, act_quant={self.act_quant_name}, output_quant={self.output_quant_name})"
 
 
 def quantize_opt(
-    model, weight_quant="per_tensor", act_quant="per_tensor", quantize_bmm_input=True
+    model,
+    weight_quant="per_tensor",
+    act_quant="per_tensor",
+    quantize_bmm_input=True,
+    a_prec=8,
+    w_prec=8,
 ):
     from transformers.models.opt.modeling_opt import (
         OPTAttention,
         OPTDecoderLayer,
     )
 
-    for name, m in model.model.named_modules():
+    for _, m in model.model.named_modules():
         if isinstance(m, OPTDecoderLayer):
-            m.fc1 = W8A8Linear.from_float(
-                m.fc1, weight_quant=weight_quant, act_quant=act_quant
+            m.fc1 = WQAQLinear.from_float(
+                m.fc1,
+                weight_quant=weight_quant,
+                act_quant=act_quant,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
-            m.fc2 = W8A8Linear.from_float(
-                m.fc2, weight_quant=weight_quant, act_quant=act_quant
+            m.fc2 = WQAQLinear.from_float(
+                m.fc2,
+                weight_quant=weight_quant,
+                act_quant=act_quant,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
         elif isinstance(m, OPTAttention):
             # Her we simulate quantizing BMM inputs by quantizing the output of q_proj, k_proj, v_proj
-            m.q_proj = W8A8Linear.from_float(
+            m.q_proj = WQAQLinear.from_float(
                 m.q_proj,
                 weight_quant=weight_quant,
                 act_quant=act_quant,
                 quantize_output=quantize_bmm_input,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
-            m.k_proj = W8A8Linear.from_float(
+            m.k_proj = WQAQLinear.from_float(
                 m.k_proj,
                 weight_quant=weight_quant,
                 act_quant=act_quant,
                 quantize_output=quantize_bmm_input,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
-            m.v_proj = W8A8Linear.from_float(
+            m.v_proj = WQAQLinear.from_float(
                 m.v_proj,
                 weight_quant=weight_quant,
                 act_quant=act_quant,
                 quantize_output=quantize_bmm_input,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
-            m.out_proj = W8A8Linear.from_float(
-                m.out_proj, weight_quant=weight_quant, act_quant=act_quant
+            m.out_proj = WQAQLinear.from_float(
+                m.out_proj,
+                weight_quant=weight_quant,
+                act_quant=act_quant,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
     return model
 
 
 def quantize_llama_like(
-    model, weight_quant="per_channel", act_quant="per_token", quantize_bmm_input=False
+    model,
+    weight_quant="per_channel",
+    act_quant="per_token",
+    quantize_bmm_input=False,
+    a_prec=8,
+    w_prec=8,
+    o_prec=8,
 ):
     from transformers.models.llama.modeling_llama import (
         LlamaAttention,
@@ -195,43 +290,77 @@ def quantize_llama_like(
 
     for name, m in model.model.named_modules():
         if isinstance(m, (LlamaMLP, MistralMLP)):
-            m.gate_proj = W8A8Linear.from_float(
-                m.gate_proj, weight_quant=weight_quant, act_quant=act_quant
+            m.gate_proj = WQAQLinear.from_float(
+                m.gate_proj,
+                weight_quant=weight_quant,
+                act_quant=act_quant,
+                a_prec=a_prec,
+                w_prec=w_prec,
+                o_prec=o_prec,
             )
-            m.up_proj = W8A8Linear.from_float(
-                m.up_proj, weight_quant=weight_quant, act_quant=act_quant
+            m.up_proj = WQAQLinear.from_float(
+                m.up_proj,
+                weight_quant=weight_quant,
+                act_quant=act_quant,
+                a_prec=a_prec,
+                w_prec=w_prec,
+                o_prec=o_prec,
             )
-            m.down_proj = W8A8Linear.from_float(
-                m.down_proj, weight_quant=weight_quant, act_quant=act_quant
+            m.down_proj = WQAQLinear.from_float(
+                m.down_proj,
+                weight_quant=weight_quant,
+                act_quant=act_quant,
+                a_prec=a_prec,
+                w_prec=w_prec,
+                o_prec=o_prec,
             )
         elif isinstance(m, (LlamaAttention, MistralAttention)):
             # Her we simulate quantizing BMM inputs by quantizing the output of q_proj, k_proj, v_proj
-            m.q_proj = W8A8Linear.from_float(
+            m.q_proj = WQAQLinear.from_float(
                 m.q_proj,
                 weight_quant=weight_quant,
                 act_quant=act_quant,
-                quantize_output=quantize_bmm_input,
+                quantize_output=False,  # q_proj output is not quantized
+                a_prec=a_prec,
+                w_prec=w_prec,
+                o_prec=o_prec,
             )
-            m.k_proj = W8A8Linear.from_float(
+            m.k_proj = WQAQLinear.from_float(
                 m.k_proj,
                 weight_quant=weight_quant,
                 act_quant=act_quant,
                 quantize_output=quantize_bmm_input,
+                a_prec=a_prec,
+                w_prec=w_prec,
+                o_prec=o_prec,
             )
-            m.v_proj = W8A8Linear.from_float(
+            m.v_proj = WQAQLinear.from_float(
                 m.v_proj,
                 weight_quant=weight_quant,
                 act_quant=act_quant,
                 quantize_output=quantize_bmm_input,
+                a_prec=a_prec,
+                w_prec=w_prec,
+                o_prec=o_prec,
             )
-            m.o_proj = W8A8Linear.from_float(
-                m.o_proj, weight_quant=weight_quant, act_quant=act_quant
+            m.o_proj = WQAQLinear.from_float(
+                m.o_proj,
+                weight_quant=weight_quant,
+                act_quant=act_quant,
+                a_prec=a_prec,
+                w_prec=w_prec,
+                o_prec=o_prec,
             )
     return model
 
 
 def quantize_mixtral(
-    model, weight_quant="per_channel", act_quant="per_token", quantize_bmm_input=False
+    model,
+    weight_quant="per_channel",
+    act_quant="per_token",
+    quantize_bmm_input=False,
+    a_prec=8,
+    w_prec=8,
 ):
     from transformers.models.mixtral.modeling_mixtral import (
         MixtralAttention,
@@ -241,47 +370,78 @@ def quantize_mixtral(
 
     for name, m in model.model.named_modules():
         if isinstance(m, MixtralBLockSparseTop2MLP):
-            m.w1 = W8A8Linear.from_float(
-                m.w1, weight_quant=weight_quant, act_quant=act_quant
+            m.w1 = WQAQLinear.from_float(
+                m.w1,
+                weight_quant=weight_quant,
+                act_quant=act_quant,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
-            m.w2 = W8A8Linear.from_float(
-                m.w2, weight_quant=weight_quant, act_quant=act_quant
+            m.w2 = WQAQLinear.from_float(
+                m.w2,
+                weight_quant=weight_quant,
+                act_quant=act_quant,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
-            m.w3 = W8A8Linear.from_float(
-                m.w3, weight_quant=weight_quant, act_quant=act_quant
+            m.w3 = WQAQLinear.from_float(
+                m.w3,
+                weight_quant=weight_quant,
+                act_quant=act_quant,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
         elif isinstance(m, MixtralAttention):
             # Her we simulate quantizing BMM inputs by quantizing the output of q_proj, k_proj, v_proj
-            m.q_proj = W8A8Linear.from_float(
+            m.q_proj = WQAQLinear.from_float(
                 m.q_proj,
                 weight_quant=weight_quant,
                 act_quant=act_quant,
                 quantize_output=quantize_bmm_input,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
-            m.k_proj = W8A8Linear.from_float(
+            m.k_proj = WQAQLinear.from_float(
                 m.k_proj,
                 weight_quant=weight_quant,
                 act_quant=act_quant,
                 quantize_output=quantize_bmm_input,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
-            m.v_proj = W8A8Linear.from_float(
+            m.v_proj = WQAQLinear.from_float(
                 m.v_proj,
                 weight_quant=weight_quant,
                 act_quant=act_quant,
                 quantize_output=quantize_bmm_input,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
-            m.o_proj = W8A8Linear.from_float(
-                m.o_proj, weight_quant=weight_quant, act_quant=act_quant
+            m.o_proj = WQAQLinear.from_float(
+                m.o_proj,
+                weight_quant=weight_quant,
+                act_quant=act_quant,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
         elif isinstance(m, MixtralSparseMoeBlock):
-            m.gate = W8A8Linear.from_float(
-                m.gate, weight_quant=weight_quant, act_quant=act_quant
+            m.gate = WQAQLinear.from_float(
+                m.gate,
+                weight_quant=weight_quant,
+                act_quant=act_quant,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
     return model
 
 
 def quantize_falcon(
-    model, weight_quant="per_channel", act_quant="per_token", quantize_bmm_input=True
+    model,
+    weight_quant="per_channel",
+    act_quant="per_token",
+    quantize_bmm_input=True,
+    a_prec=8,
+    w_prec=8,
 ):
     from transformers.models.falcon.modeling_falcon import (
         FalconAttention,
@@ -290,28 +450,47 @@ def quantize_falcon(
 
     for name, m in model.named_modules():
         if isinstance(m, FalconMLP):
-            m.dense_h_to_4h = W8A8Linear.from_float(
-                m.dense_h_to_4h, weight_quant=weight_quant, act_quant=act_quant
+            m.dense_h_to_4h = WQAQLinear.from_float(
+                m.dense_h_to_4h,
+                weight_quant=weight_quant,
+                act_quant=act_quant,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
-            m.dense_4h_to_h = W8A8Linear.from_float(
-                m.dense_4h_to_h, weight_quant=weight_quant, act_quant=act_quant
+            m.dense_4h_to_h = WQAQLinear.from_float(
+                m.dense_4h_to_h,
+                weight_quant=weight_quant,
+                act_quant=act_quant,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
         elif isinstance(m, FalconAttention):
             # Her we simulate quantizing BMM inputs by quantizing the output of q_proj, k_proj, v_proj
-            m.query_key_value = W8A8Linear.from_float(
+            m.query_key_value = WQAQLinear.from_float(
                 m.query_key_value,
                 weight_quant=weight_quant,
                 act_quant=act_quant,
                 quantize_output=quantize_bmm_input,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
-            m.dense = W8A8Linear.from_float(
-                m.dense, weight_quant=weight_quant, act_quant=act_quant
+            m.dense = WQAQLinear.from_float(
+                m.dense,
+                weight_quant=weight_quant,
+                act_quant=act_quant,
+                a_prec=a_prec,
+                w_prec=w_prec,
             )
     return model
 
 
 def quantize_model(
-    model, weight_quant="per_channel", act_quant="per_token", quantize_bmm_input=False
+    model,
+    weight_quant="per_channel",
+    act_quant="per_token",
+    quantize_bmm_input=False,
+    a_prec=8,
+    w_prec=8,
 ):
     from transformers.models.opt.modeling_opt import OPTPreTrainedModel
     from transformers.models.llama.modeling_llama import LlamaPreTrainedModel
@@ -325,6 +504,8 @@ def quantize_model(
             weight_quant=weight_quant,
             act_quant=act_quant,
             quantize_bmm_input=quantize_bmm_input,
+            a_prec=a_prec,
+            w_prec=w_prec,
         )
     elif isinstance(model, (LlamaPreTrainedModel, MistralPreTrainedModel)):
         return quantize_llama_like(
@@ -332,6 +513,8 @@ def quantize_model(
             weight_quant=weight_quant,
             act_quant=act_quant,
             quantize_bmm_input=quantize_bmm_input,
+            a_prec=a_prec,
+            w_prec=w_prec,
         )
     elif isinstance(model, MixtralPreTrainedModel):
         return quantize_mixtral(
@@ -339,6 +522,8 @@ def quantize_model(
             weight_quant=weight_quant,
             act_quant=act_quant,
             quantize_bmm_input=quantize_bmm_input,
+            a_prec=a_prec,
+            w_prec=w_prec,
         )
     elif isinstance(model, FalconPreTrainedModel):
         return quantize_falcon(
@@ -346,6 +531,8 @@ def quantize_model(
             weight_quant=weight_quant,
             act_quant=act_quant,
             quantize_bmm_input=quantize_bmm_input,
+            a_prec=a_prec,
+            w_prec=w_prec,
         )
     else:
         raise ValueError(f"Unsupported model type: {type(model)}")
