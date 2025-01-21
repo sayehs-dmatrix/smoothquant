@@ -44,7 +44,11 @@ def get_act_scales(model, tokenizer, dataset_path, num_samples=512, seq_len=512)
         input_ids = tokenizer(
             dataset[i]["text"], return_tensors="pt", max_length=seq_len, truncation=True
         ).input_ids.to(device)
-        model(input_ids)
+        
+        try:
+            model(input_ids)
+        except: 
+            continue
 
     for h in hooks:
         h.remove()
