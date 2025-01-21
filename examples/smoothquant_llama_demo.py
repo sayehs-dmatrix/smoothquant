@@ -171,18 +171,18 @@ def main():
     import lm_eval
 
     TASK_LIST = [
-        # "mmlu_other",
-        # "mmlu_stem",
-        # "mmlu_social_sciences",
-        # "mmlu_humanities",
+        "mmlu_other",
+        "mmlu_stem",
+        "mmlu_social_sciences",
+        "mmlu_humanities",
         "arc_easy",
         "arc_challenge",
-        # "piqa",
-        # "winogrande",
-        # "boolq",
-        # "social_iqa",
-        # "openbookqa",
-        # "hellaswag",
+        "piqa",
+        "winogrande",
+        "boolq",
+        "social_iqa",
+        "openbookqa",
+        "hellaswag",
     ]
     EVAL_BS = 16
 

@@ -283,13 +283,18 @@ def quantize_llama_like(
         LlamaMLP,
     )
 
+    from transformers.models.qwen2.modeling_qwen2 import (
+        Qwen2Attention,
+        Qwen2MLP,
+    )
+
     from transformers.models.mistral.modeling_mistral import (
         MistralAttention,
         MistralMLP,
     )
 
     for name, m in model.model.named_modules():
-        if isinstance(m, (LlamaMLP, MistralMLP)):
+        if isinstance(m, (LlamaMLP, Qwen2MLP, MistralMLP)):
             m.gate_proj = WQAQLinear.from_float(
                 m.gate_proj,
                 weight_quant=weight_quant,
@@ -314,7 +319,7 @@ def quantize_llama_like(
                 w_prec=w_prec,
                 o_prec=o_prec,
             )
-        elif isinstance(m, (LlamaAttention, MistralAttention)):
+        elif isinstance(m, (LlamaAttention, Qwen2Attention, MistralAttention)):
             # Her we simulate quantizing BMM inputs by quantizing the output of q_proj, k_proj, v_proj
             m.q_proj = WQAQLinear.from_float(
                 m.q_proj,
@@ -494,6 +499,7 @@ def quantize_model(
 ):
     from transformers.models.opt.modeling_opt import OPTPreTrainedModel
     from transformers.models.llama.modeling_llama import LlamaPreTrainedModel
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2PreTrainedModel
     from transformers.models.mistral.modeling_mistral import MistralPreTrainedModel
     from transformers.models.mixtral.modeling_mixtral import MixtralPreTrainedModel
     from transformers.models.falcon.modeling_falcon import FalconPreTrainedModel
@@ -507,7 +513,7 @@ def quantize_model(
             a_prec=a_prec,
             w_prec=w_prec,
         )
-    elif isinstance(model, (LlamaPreTrainedModel, MistralPreTrainedModel)):
+    elif isinstance(model, (LlamaPreTrainedModel, Qwen2PreTrainedModel, MistralPreTrainedModel)):
         return quantize_llama_like(
             model,
             weight_quant=weight_quant,
